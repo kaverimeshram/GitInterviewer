@@ -1,0 +1,50 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Interview {
+  id             String          @id @default(uuid())
+  githubUrl      String
+  githubMetadata Json            // Stores scraped repos, profile, pre-generated questions
+  status         InterviewStatus @default(Pre)
+  difficulty     String          @default("Medium") // "Easy" | "Medium" | "Hard"
+  questionCount  Int             @default(0)
+  createdAt      DateTime        @default(now())
+
+  messages       Message[]
+  result         Result?
+}
+
+model Message {
+  id          String    @id @default(uuid())
+  interviewId String
+  interview   Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  role        String    // "user" | "assistant"
+  content     String
+  createdAt   DateTime  @default(now())
+}
+
+model Result {
+  id                 String    @id @default(uuid())
+  interviewId        String    @unique
+  interview          Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  score              Int       // Overall score out of 100
+  feedback           String
+  strengths          String[]
+  weaknesses         String[]
+  recommendations    String[]
+  technicalKnowledge Int       // Category score out of 10
+  problemSolving     Int       // Category score out of 10
+  communication      Int       // Category score out of 10
+  confidence         Int       // Category score out of 10
+}
+
+enum InterviewStatus {
+  Pre
+  InProgress
+  Done
+}
