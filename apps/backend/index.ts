@@ -14,6 +14,21 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-2";
+const TRANSCRIPTION_MODEL = process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-mini-transcribe";
+const REALTIME_VOICES = new Set([
+  "alloy",
+  "ash",
+  "ballad",
+  "coral",
+  "echo",
+  "sage",
+  "shimmer",
+  "verse",
+  "marin",
+  "cedar",
+]);
+
 // POST /api/v1/pre-interview
 app.post("/api/v1/pre-interview", async (req, res) => {
   try {
@@ -80,27 +95,16 @@ app.get("/api/v1/interview/:interviewId", async (req, res) => {
       return;
     }
 
-    // If session is Pre, start the interview and choose/generate first question
+    // If session is Pre, start the interview and greet the candidate first
     if (interview.status === "Pre") {
-      const metadata = interview.githubMetadata as any;
-      const preGenerated = metadata?.preGeneratedQuestions || [];
+      const initialGreeting = "Hello! Welcome to your technical interview today. I've analyzed your GitHub profile. To start off, could you tell me a bit about your work experience?";
 
-      // Choose first question
-      let firstQuestion = "Could you tell me about the architecture of your primary GitHub project?";
-      if (preGenerated.length > 0) {
-        // Prefer starting with an Easy or Medium difficulty question
-        const startingQuestion =
-          preGenerated.find((q: any) => q.difficulty === "Medium" || q.difficulty === "Easy") ||
-          preGenerated[0];
-        firstQuestion = startingQuestion.question;
-      }
-
-      // Save the first question as a message
+      // Save the introductory greeting as a message
       await prisma.message.create({
         data: {
           interviewId,
           role: "assistant",
-          content: firstQuestion,
+          content: initialGreeting,
         },
       });
 
@@ -108,7 +112,7 @@ app.get("/api/v1/interview/:interviewId", async (req, res) => {
         where: { id: interviewId },
         data: {
           status: "InProgress",
-          questionCount: 1,
+          questionCount: 0,
         },
         include: { messages: true },
       });
@@ -117,7 +121,7 @@ app.get("/api/v1/interview/:interviewId", async (req, res) => {
         status: updatedInterview.status,
         difficulty: updatedInterview.difficulty,
         questionCount: updatedInterview.questionCount,
-        currentQuestion: firstQuestion,
+        currentQuestion: initialGreeting,
         messages: updatedInterview.messages,
       });
       return;
@@ -183,6 +187,67 @@ app.post("/api/v1/interview/chat", async (req, res) => {
       role: m.role,
       content: m.content,
     }));
+
+    // Handle conversational introduction turns if questionCount is 0
+    if (interview.questionCount === 0) {
+      const assistantMessages = allMessages.filter((m) => m.role === "assistant");
+      const assistantMsgCount = assistantMessages.length;
+
+      if (assistantMsgCount === 1) {
+        // Stage 1: Candidate has answered with their work experience.
+        // Respond asking for confirmation to start the technical interview questions.
+        const readyCheckMsg = "Thanks for sharing that! Based on your experience and your GitHub repositories, I've prepared a set of adaptive technical questions. Are you ready to begin the technical part of the interview?";
+
+        await prisma.message.create({
+          data: {
+            interviewId,
+            role: "assistant",
+            content: readyCheckMsg,
+          },
+        });
+
+        res.json({
+          reply: readyCheckMsg,
+          ended: false,
+        });
+        return;
+      } else if (assistantMsgCount === 2) {
+        // Stage 2: Candidate has confirmed they are ready.
+        // Fetch and ask the first actual GitHub-based question.
+        const metadata = interview.githubMetadata as any;
+        const preGenerated = metadata?.preGeneratedQuestions || [];
+
+        let firstQuestion = "Could you tell me about the architecture of your primary GitHub project?";
+        if (preGenerated.length > 0) {
+          const startingQuestion =
+            preGenerated.find((q: any) => q.difficulty === "Medium" || q.difficulty === "Easy") ||
+            preGenerated[0];
+          firstQuestion = startingQuestion.question;
+        }
+
+        await prisma.message.create({
+          data: {
+            interviewId,
+            role: "assistant",
+            content: firstQuestion,
+          },
+        });
+
+        // Update database: questionCount is now 1
+        await prisma.interview.update({
+          where: { id: interviewId },
+          data: {
+            questionCount: 1,
+          },
+        });
+
+        res.json({
+          reply: firstQuestion,
+          ended: false,
+        });
+        return;
+      }
+    }
 
     // 3. Evaluate answer and get next question
     const evaluation = await evaluateAnswerAndGetNextQuestion(
@@ -529,6 +594,203 @@ app.get("/api/v1/result/:interviewId/pdf", async (req, res) => {
   } catch (err: any) {
     console.error("PDF generation failed:", err);
     res.status(500).send("Failed to generate PDF report");
+  }
+});
+
+// POST /api/v1/interview/:interviewId/session
+app.post("/api/v1/interview/:interviewId/session", async (req, res) => {
+  try {
+    const { interviewId } = req.params;
+    const requestedVoice = typeof req.body?.voice === "string" ? req.body.voice : "";
+    const voice = REALTIME_VOICES.has(requestedVoice) ? requestedVoice : "marin";
+    const interview = await prisma.interview.findUnique({
+      where: { id: interviewId },
+    });
+
+    if (!interview) {
+      res.status(404).json({ error: "Interview session not found" });
+      return;
+    }
+
+    const metadata = interview.githubMetadata as any;
+    const reposStr = JSON.stringify(metadata?.repos || []);
+    const questionsStr = JSON.stringify(metadata?.preGeneratedQuestions || []);
+
+    const systemInstructions = `
+You are GitInterviewer, a senior tech lead conducting a natural technical voice interview.
+The candidate's GitHub repositories:
+${reposStr}
+
+Pre-generated questions to target:
+${questionsStr}
+
+Your instructions:
+1. Speak only in English. Do not switch languages. If the candidate speaks another language, politely ask them to continue in English.
+2. Start with a warm greeting, introduce yourself, and ask the candidate to briefly describe their work experience.
+3. After they answer, acknowledge it naturally and ask if they are ready to begin the technical questions.
+4. After they confirm, ask exactly 5 technical questions based on the repositories. Use the pre-generated list as a guide, but ask one question at a time and wait for the candidate's answer before moving on.
+5. Number technical questions clearly as "Question 1 of 5", "Question 2 of 5", and so on.
+6. Keep responses concise and conversational. Do not output large code blocks unless the candidate explicitly asks.
+7. Do not answer for the candidate, continue from silence, or invent candidate responses. Wait for the candidate's speech or typed message.
+8. After the candidate answers Question 5 of 5, thank them and end with the exact sentence: "The interview is now complete."
+`.trim();
+
+    const openAiRes = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+        "OpenAI-Safety-Identifier": `interview-${interviewId}`,
+      },
+      body: JSON.stringify({
+        expires_after: {
+          anchor: "created_at",
+          seconds: 600,
+        },
+        session: {
+          type: "realtime",
+          model: REALTIME_MODEL,
+          instructions: systemInstructions,
+          output_modalities: ["audio"],
+          audio: {
+            input: {
+              transcription: {
+                model: TRANSCRIPTION_MODEL,
+                language: "en",
+                prompt: "Technical interview answers in English. Preserve programming language names, repository names, framework names, and acronyms accurately.",
+              },
+              noise_reduction: {
+                type: "near_field",
+              },
+              turn_detection: {
+                type: "semantic_vad",
+                eagerness: "medium",
+                create_response: true,
+                interrupt_response: true,
+              },
+            },
+            output: {
+              voice,
+              speed: 1.0,
+            },
+          },
+          max_output_tokens: 700,
+        },
+      }),
+    });
+
+    const data = await openAiRes.json() as any;
+    if (data.error) {
+      console.error("OpenAI Realtime error:", data.error);
+      res.status(500).json({ error: data.error.message || "Failed to create realtime session" });
+      return;
+    }
+
+    const token = data.client_secret?.value || data.value;
+    if (!token) {
+      console.error("OpenAI Realtime error - no token returned:", data);
+      res.status(500).json({ error: "No client secret token returned by OpenAI" });
+      return;
+    }
+
+    res.json({
+      client_secret: token,
+      model: REALTIME_MODEL,
+      voice,
+    });
+  } catch (err: any) {
+    console.error("Error creating realtime session:", err);
+    res.status(500).json({ error: err.message || "Failed to create realtime session" });
+  }
+});
+
+// POST /api/v1/interview/:interviewId/finalize
+app.post("/api/v1/interview/:interviewId/finalize", async (req, res) => {
+  try {
+    const { interviewId } = req.params;
+    const { messages } = req.body; // Array of { role, content }
+
+    if (!Array.isArray(messages)) {
+      res.status(400).json({ error: "Missing or invalid messages list" });
+      return;
+    }
+
+    const transcriptMessages = messages
+      .filter((m: any) => (m?.role === "assistant" || m?.role === "user") && typeof m?.content === "string")
+      .map((m: any) => ({
+        role: m.role,
+        content: m.content.trim(),
+      }))
+      .filter((m: { role: string; content: string }) => m.content.length > 0);
+
+    const interview = await prisma.interview.findUnique({
+      where: { id: interviewId },
+    });
+
+    if (!interview) {
+      res.status(404).json({ error: "Interview session not found" });
+      return;
+    }
+
+    // 1. Delete any existing messages to avoid duplicates
+    await prisma.message.deleteMany({
+      where: { interviewId },
+    });
+
+    // 2. Insert the final messages log
+    if (transcriptMessages.length > 0) {
+      await prisma.message.createMany({
+        data: transcriptMessages.map((m) => ({
+          interviewId,
+          role: m.role,
+          content: m.content,
+        })),
+      });
+    }
+
+    // 3. Mark interview as Done
+    await prisma.interview.update({
+      where: { id: interviewId },
+      data: {
+        status: "Done",
+      },
+    });
+
+    // 4. Generate the final evaluation report using OpenAI Realtime transcript
+    const finalEval = await generateFinalEvaluation(interview.githubMetadata, transcriptMessages);
+
+    // 5. Save evaluation scorecard
+    await prisma.result.upsert({
+      where: { interviewId },
+      update: {
+        score: finalEval.overallScore,
+        feedback: finalEval.feedback,
+        strengths: finalEval.strengths,
+        weaknesses: finalEval.weaknesses,
+        recommendations: finalEval.recommendations,
+        technicalKnowledge: finalEval.technicalKnowledge,
+        problemSolving: finalEval.problemSolving,
+        communication: finalEval.communication,
+        confidence: finalEval.confidence,
+      },
+      create: {
+        interviewId,
+        score: finalEval.overallScore,
+        feedback: finalEval.feedback,
+        strengths: finalEval.strengths,
+        weaknesses: finalEval.weaknesses,
+        recommendations: finalEval.recommendations,
+        technicalKnowledge: finalEval.technicalKnowledge,
+        problemSolving: finalEval.problemSolving,
+        communication: finalEval.communication,
+        confidence: finalEval.confidence,
+      },
+    });
+
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error("Error finalizing interview:", err);
+    res.status(500).json({ error: err.message || "Failed to finalize interview scorecard" });
   }
 });
 

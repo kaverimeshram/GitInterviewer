@@ -3,7 +3,7 @@ import axios from "axios";
 import { useParams, useNavigate } from "react-router-dom";
 import { BACKEND_URL } from "@/lib/config";
 import { VoiceOrb } from "./VoiceOrb";
-import { Bot, User, Volume2, VolumeX, Award, ArrowRight, Loader2, StopCircle, CornerDownLeft, AlertCircle, Sparkles, Mic, Code, Play } from "lucide-react";
+import { Bot, User, Volume2, VolumeX, Award, Loader2, StopCircle, CornerDownLeft, Sparkles, Mic, Play } from "lucide-react";
 import { Button } from "./ui/button";
 import { toast } from "sonner";
 
@@ -23,6 +23,18 @@ const GithubIcon = (props: React.SVGProps<SVGSVGElement>) => (
   </svg>
 );
 
+const REALTIME_VOICES = [
+  { id: "marin", label: "Marin", description: "Warm and natural" },
+  { id: "cedar", label: "Cedar", description: "Calm and grounded" },
+  { id: "coral", label: "Coral", description: "Clear and bright" },
+  { id: "sage", label: "Sage", description: "Measured and focused" },
+] as const;
+
+type RealtimeVoice = (typeof REALTIME_VOICES)[number]["id"];
+type ChatMessage = { role: "assistant" | "user"; content: string };
+
+const COMPLETION_PHRASE = "the interview is now complete";
+
 export function Interview() {
   const { interviewId } = useParams();
   const navigate = useNavigate();
@@ -30,10 +42,7 @@ export function Interview() {
   // Lobby & Setup state
   const [hasStarted, setHasStarted] = useState(false);
   const [voiceOutputEnabled, setVoiceOutputEnabled] = useState(true);
-  
-  // Voices dropdown state
-  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
-  const [selectedVoiceName, setSelectedVoiceName] = useState<string>("");
+  const [selectedRealtimeVoice, setSelectedRealtimeVoice] = useState<RealtimeVoice>("marin");
 
   // Interview state
   const [currentQuestion, setCurrentQuestion] = useState("");
@@ -44,6 +53,7 @@ export function Interview() {
   const [difficulty, setDifficulty] = useState("Medium");
   const [isEnded, setIsEnded] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [finalizing, setFinalizing] = useState(false);
 
   // Audio/Visualizer state
   const [volumeUser, setVolumeUser] = useState(0);
@@ -54,13 +64,145 @@ export function Interview() {
   // Fallback typing state
   const [useTextFallback, setUseTextFallback] = useState(false);
 
-  // Speech and Audio references
-  const recognitionRef = useRef<any>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
-  const aiVolumeIntervalRef = useRef<any>(null);
+  // WebRTC & Audio refs
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const dcRef = useRef<RTCDataChannel | null>(null);
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const audioSenderRef = useRef<RTCRtpSender | null>(null);
+
+  // Analysers & Contexts for Reactive Volume driving VoiceOrbs
+  const userAudioCtxRef = useRef<AudioContext | null>(null);
+  const userAnalyserRef = useRef<AnalyserNode | null>(null);
+  const userAnimationFrameRef = useRef<number | null>(null);
+
+  const aiAudioCtxRef = useRef<AudioContext | null>(null);
+  const aiAnalyserRef = useRef<AnalyserNode | null>(null);
+  const aiAnimationFrameRef = useRef<number | null>(null);
+  const finalizingRef = useRef(false);
+  const useTextFallbackRef = useRef(useTextFallback);
+
+  // Chat message transcript store
+  const [, setChatMessages] = useState<ChatMessage[]>([]);
+  const chatMessagesRef = useRef<ChatMessage[]>([]);
+
+  const appendChatMessage = (message: ChatMessage) => {
+    const content = message.content.trim();
+    if (!content) return chatMessagesRef.current;
+
+    const current = chatMessagesRef.current;
+    const last = current[current.length - 1];
+    if (last?.role === message.role && last.content === content) {
+      return current;
+    }
+
+    const next = [...current, { ...message, content }];
+    chatMessagesRef.current = next;
+    setChatMessages(next);
+    return next;
+  };
+
+  const updateQuestionProgress = (assistantText: string) => {
+    const match = assistantText.match(/question\s+([1-5])\s*(?:of|\/)\s*5/i);
+    if (match?.[1]) {
+      setQuestionCount(Number(match[1]));
+    }
+  };
+
+  const isCompletionText = (assistantText: string) =>
+    assistantText.toLowerCase().includes(COMPLETION_PHRASE);
+
+  const setMicTrackEnabled = (enabled: boolean) => {
+    localStreamRef.current?.getAudioTracks().forEach((track) => {
+      track.enabled = enabled;
+    });
+  };
+
+  const stopUserVolumeAnalyser = () => {
+    if (userAnimationFrameRef.current) {
+      cancelAnimationFrame(userAnimationFrameRef.current);
+      userAnimationFrameRef.current = null;
+    }
+    if (userAudioCtxRef.current) {
+      void userAudioCtxRef.current.close();
+      userAudioCtxRef.current = null;
+    }
+    userAnalyserRef.current = null;
+    setVolumeUser(0);
+    setSpeakingUser(false);
+  };
+
+  const requestMicrophoneStream = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error("Microphone capture is not supported in this browser.");
+    }
+
+    return navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+  };
+
+  const attachMicrophoneToSession = async () => {
+    const pc = pcRef.current;
+    if (!pc) {
+      toast.error("Start the interview before switching to voice.");
+      return false;
+    }
+
+    try {
+      const localStream = localStreamRef.current || await requestMicrophoneStream();
+      localStreamRef.current = localStream;
+      const audioTrack = localStream.getAudioTracks()[0];
+      if (!audioTrack) {
+        throw new Error("No microphone track was found.");
+      }
+
+      audioTrack.enabled = true;
+
+      if (audioSenderRef.current) {
+        await audioSenderRef.current.replaceTrack(audioTrack);
+      } else if (pc.currentRemoteDescription) {
+        throw new Error("Refresh the interview page and start again to enable voice input for this session.");
+      } else {
+        audioSenderRef.current = pc.addTrack(audioTrack, localStream);
+      }
+
+      stopUserVolumeAnalyser();
+      setupUserVolumeAnalyser(localStream);
+      return true;
+    } catch (err: any) {
+      console.error("Failed to enable microphone input:", err);
+      const permissionDenied =
+        err?.name === "NotAllowedError" ||
+        err?.name === "PermissionDeniedError" ||
+        String(err?.message || "").toLowerCase().includes("permission denied");
+
+      if (permissionDenied) {
+        toast.error("Microphone permission is blocked. Allow mic access in the browser, then try voice again.");
+        setStatus("Microphone permission denied");
+      } else {
+        toast.error(err.message || "Could not enable microphone input.");
+        setStatus("Could not enable microphone");
+      }
+      return false;
+    }
+  };
+
+  const detachMicrophoneFromSession = async () => {
+    setMicTrackEnabled(false);
+    if (audioSenderRef.current) {
+      await audioSenderRef.current.replaceTrack(null);
+    }
+    stopUserVolumeAnalyser();
+  };
+
+  useEffect(() => {
+    useTextFallbackRef.current = useTextFallback;
+  }, [useTextFallback]);
 
   // Load status
   useEffect(() => {
@@ -72,8 +214,6 @@ export function Interview() {
         if (!active) return;
         
         const data = response.data;
-        setCurrentQuestion(data.currentQuestion);
-        setQuestionCount(data.questionCount);
         setDifficulty(data.difficulty);
         setLoading(false);
       } catch (err: any) {
@@ -89,148 +229,186 @@ export function Interview() {
 
     return () => {
       active = false;
-      // Cleanup audio synthesis and mic volume tracking
-      stopSpeaking();
-      stopMicVolume();
-      if (recognitionRef.current) {
-        recognitionRef.current.abort();
-      }
+      cleanupWebRTC();
     };
   }, [interviewId]);
 
-  // Load and subscribe to text-to-speech voices
-  useEffect(() => {
-    if (!("speechSynthesis" in window)) return;
-
-    const loadVoices = () => {
-      const allVoices = window.speechSynthesis.getVoices();
-      // Filter for English voices primarily, fallback to all voices
-      const englishVoices = allVoices.filter(v => v.lang.startsWith("en"));
-      const availableVoices = englishVoices.length > 0 ? englishVoices : allVoices;
-      setVoices(availableVoices);
-
-      // Select default voice
-      if (availableVoices.length > 0) {
-        // Try to find natural/Google/Siri high quality english voice as default
-        const defaultVoice = 
-          availableVoices.find(v => v.name.includes("Google") || v.name.includes("Natural") || v.name.includes("Samantha")) || 
-          availableVoices[0];
-        if (defaultVoice) {
-          setSelectedVoiceName(defaultVoice.name);
-        }
-      }
-    };
-
-    loadVoices();
-    // Voices load asynchronously in some browsers (e.g. Chrome)
-    window.speechSynthesis.onvoiceschanged = loadVoices;
-  }, []);
-
-  // Start the interview from the lobby
-  const startInterviewSession = () => {
-    setHasStarted(true);
-    if (currentQuestion) {
-      if (voiceOutputEnabled) {
-        speakText(currentQuestion);
-      } else {
-        setStatus(useTextFallback ? "Ready" : "🎤 Listening for your answer...");
-        if (!useTextFallback) {
-          setTimeout(() => {
-            startListening();
-          }, 300);
-        }
-      }
+  const cleanupWebRTC = () => {
+    if (userAnimationFrameRef.current) {
+      cancelAnimationFrame(userAnimationFrameRef.current);
+      userAnimationFrameRef.current = null;
     }
-  };
-
-  // AI Speech Synthesis
-  const speakText = (text: string) => {
-    stopSpeaking();
-    
-    if (!voiceOutputEnabled) return;
-
-    if (!("speechSynthesis" in window)) {
-      toast.error("Speech Synthesis is not supported in this browser.");
-      return;
+    if (aiAnimationFrameRef.current) {
+      cancelAnimationFrame(aiAnimationFrameRef.current);
+      aiAnimationFrameRef.current = null;
     }
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "en-US";
-
-    // Attach selected voice
-    if (selectedVoiceName) {
-      const activeVoice = window.speechSynthesis.getVoices().find(v => v.name === selectedVoiceName);
-      if (activeVoice) {
-        utterance.voice = activeVoice;
-      }
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
     }
-
-    utterance.onstart = () => {
-      setSpeakingAI(true);
-      startAIVolumeSimulation();
-      setStatus("🤖 AI is asking...");
-    };
-
-    utterance.onend = () => {
-      setSpeakingAI(false);
-      stopAIVolumeSimulation();
-      setStatus("🎤 Listening for your answer...");
-      
-      // Auto-start listening after AI finishes speaking (if not using text fallback)
-      if (!useTextFallback) {
-        startListening();
-      }
-    };
-
-    utterance.onerror = (event) => {
-      console.error("Speech synthesis error:", event);
-      setSpeakingAI(false);
-      stopAIVolumeSimulation();
-      setStatus("Ready");
-    };
-
-    window.speechSynthesis.speak(utterance);
-  };
-
-  const stopSpeaking = () => {
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
+    if (userAudioCtxRef.current) {
+      void userAudioCtxRef.current.close();
+      userAudioCtxRef.current = null;
     }
-    setSpeakingAI(false);
-    stopAIVolumeSimulation();
-  };
-
-  // Simulated AI volume level based on sinusoidal frequency waves
-  const startAIVolumeSimulation = () => {
-    if (aiVolumeIntervalRef.current) clearInterval(aiVolumeIntervalRef.current);
-    aiVolumeIntervalRef.current = setInterval(() => {
-      const targetVal = Math.sin(Date.now() / 80) * 0.35 + 0.5;
-      setVolumeAI(Math.max(0.15, targetVal + (Math.random() - 0.5) * 0.15));
-    }, 75);
-  };
-
-  const stopAIVolumeSimulation = () => {
-    if (aiVolumeIntervalRef.current) {
-      clearInterval(aiVolumeIntervalRef.current);
-      aiVolumeIntervalRef.current = null;
+    if (aiAudioCtxRef.current) {
+      void aiAudioCtxRef.current.close();
+      aiAudioCtxRef.current = null;
     }
+    if (dcRef.current) {
+      dcRef.current.close();
+      dcRef.current = null;
+    }
+    audioSenderRef.current = null;
+    if (pcRef.current) {
+      pcRef.current.close();
+      pcRef.current = null;
+    }
+    if (audioElRef.current) {
+      audioElRef.current.remove();
+      audioElRef.current = null;
+    }
+    userAnalyserRef.current = null;
+    aiAnalyserRef.current = null;
+    setVolumeUser(0);
     setVolumeAI(0);
+    setSpeakingUser(false);
+    setSpeakingAI(false);
   };
 
-  // Web Audio Analyser Node for Candidate Speech Volume
-  const startMicVolume = async () => {
+  const finalizeInterview = async (messages = chatMessagesRef.current) => {
+    if (finalizingRef.current) return;
+
+    finalizingRef.current = true;
+    setFinalizing(true);
+    setLoading(true);
+    setStatus("Finalizing evaluation scorecard...");
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
+      cleanupWebRTC();
 
+      await axios.post(`${BACKEND_URL}/api/v1/interview/${interviewId}/finalize`, {
+        messages,
+      });
+
+      toast.success("Evaluation compiled. Loading scorecard...");
+      navigate(`/result/${interviewId}`);
+    } catch (err: any) {
+      console.error("Failed to finalize interview:", err);
+      toast.error("Evaluation scorecard compilation failed. Redirecting.");
+      navigate(`/result/${interviewId}`);
+    }
+  };
+
+  // Start the interview via WebRTC Realtime
+  const startInterviewSession = async () => {
+    setLoading(true);
+    setStatus("Establishing connection...");
+    setCurrentQuestion("");
+    setTranscript("");
+    setQuestionCount(0);
+    setIsEnded(false);
+    setFinalizing(false);
+    finalizingRef.current = false;
+    chatMessagesRef.current = [];
+    setChatMessages([]);
+
+    try {
+      // 1. Fetch ephemeral client secret from backend
+      const res = await axios.post(`${BACKEND_URL}/api/v1/interview/${interviewId}/session`, {
+        voice: selectedRealtimeVoice,
+      });
+      const ephemeralToken = res.data.client_secret;
+
+      // 2. Setup audio playback
+      const audioEl = document.createElement("audio");
+      audioEl.autoplay = true;
+      audioEl.muted = !voiceOutputEnabled;
+      document.body.appendChild(audioEl);
+      audioElRef.current = audioEl;
+
+      // 3. Create peer connection
+      const pc = new RTCPeerConnection();
+      pcRef.current = pc;
+
+      // 4. Handle incoming tracks (AI Voice)
+      pc.ontrack = (event) => {
+        audioEl.srcObject = event.streams[0];
+        setupAIVolumeAnalyser(event.streams[0]);
+      };
+
+      // 5. Configure audio input. Text mode should not request microphone access.
+      if (useTextFallback) {
+        const audioTransceiver = pc.addTransceiver("audio", { direction: "sendrecv" });
+        audioSenderRef.current = audioTransceiver.sender;
+      } else {
+        const localStream = await requestMicrophoneStream();
+        localStreamRef.current = localStream;
+        const audioTrack = localStream.getAudioTracks()[0];
+        if (audioTrack) {
+          audioSenderRef.current = pc.addTrack(audioTrack, localStream);
+        }
+        setupUserVolumeAnalyser(localStream);
+      }
+
+      // 6. Create event data channel
+      const dc = pc.createDataChannel("oai-events");
+      dcRef.current = dc;
+      setupDataChannelListeners(dc);
+
+      // 7. SDP Offer-Answer Exchange
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      const sdpResponse = await fetch("https://api.openai.com/v1/realtime/calls", {
+        method: "POST",
+        body: offer.sdp,
+        headers: {
+          Authorization: `Bearer ${ephemeralToken}`,
+          "Content-Type": "application/sdp",
+        },
+      });
+
+      if (!sdpResponse.ok) {
+        const errorText = await sdpResponse.text();
+        throw new Error(`OpenAI WebRTC call rejected: ${errorText}`);
+      }
+
+      const sdpAnswer = await sdpResponse.text();
+      await pc.setRemoteDescription({ type: "answer", sdp: sdpAnswer });
+
+      setHasStarted(true);
+      setLoading(false);
+      setStatus(useTextFallback ? "Connected - text input active" : "Connected - speak naturally");
+    } catch (err: any) {
+      console.error("Failed to connect WebRTC voice agent:", err);
+      cleanupWebRTC();
+      const permissionDenied =
+        err?.name === "NotAllowedError" ||
+        err?.name === "PermissionDeniedError" ||
+        String(err?.message || "").toLowerCase().includes("permission denied");
+      if (permissionDenied) {
+        setUseTextFallback(true);
+        toast.error("Microphone permission was denied. Allow mic access, or start again in Text Input Mode.");
+        setStatus("Microphone permission denied");
+      } else {
+        toast.error(err.message || "Failed to establish real-time voice connection. Please try again.");
+        setStatus("Error connecting");
+      }
+      setLoading(false);
+    }
+  };
+
+  // User mic volume analyser
+  const setupUserVolumeAnalyser = (stream: MediaStream) => {
+    try {
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      const audioContext = new AudioContextClass();
-      audioContextRef.current = audioContext;
+      const ctx = new AudioContextClass();
+      userAudioCtxRef.current = ctx;
 
-      const source = audioContext.createMediaStreamSource(stream);
-      const analyser = audioContext.createAnalyser();
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
       analyser.fftSize = 256;
-      analyserRef.current = analyser;
+      userAnalyserRef.current = analyser;
 
       source.connect(analyser);
 
@@ -238,8 +416,8 @@ export function Interview() {
       const dataArray = new Uint8Array(bufferLength);
 
       const checkVolume = () => {
-        if (!analyserRef.current) return;
-        analyserRef.current.getByteTimeDomainData(dataArray);
+        if (!userAnalyserRef.current) return;
+        userAnalyserRef.current.getByteTimeDomainData(dataArray);
 
         let sum = 0;
         for (let i = 0; i < bufferLength; i++) {
@@ -247,191 +425,210 @@ export function Interview() {
           sum += val * val;
         }
         const rms = Math.sqrt(sum / bufferLength);
-        // Amplify the mic visual responsiveness
         const level = Math.min(1, rms * 6);
         setVolumeUser(level);
+        setSpeakingUser(level > 0.05);
 
-        animationFrameRef.current = requestAnimationFrame(checkVolume);
+        userAnimationFrameRef.current = requestAnimationFrame(checkVolume);
       };
 
       checkVolume();
     } catch (err) {
-      console.warn("Could not start micro-volume visualizer:", err);
+      console.warn("Could not start local microphone volume tracker:", err);
     }
   };
 
-  const stopMicVolume = () => {
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-    analyserRef.current = null;
-    setVolumeUser(0);
-  };
-
-  // Speech Recognition (Speech-to-Text)
-  const startListening = () => {
-    stopSpeaking();
-    stopMicVolume();
-
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-      setUseTextFallback(true);
-      toast.warning("Speech Recognition is not supported by your browser. Reverting to text entry.");
-      return;
-    }
-
-    const recognition = new SpeechRecognition();
-    recognitionRef.current = recognition;
-    recognition.continuous = false;
-    recognition.interimResults = true;
-    recognition.lang = "en-US";
-
-    recognition.onstart = () => {
-      setSpeakingUser(true);
-      setTranscript("");
-      setStatus("🎤 Listening... Speak now.");
-      startMicVolume();
-    };
-
-    recognition.onresult = (event: any) => {
-      const currentTranscript = Array.from(event.results)
-        .map((result: any) => result[0].transcript)
-        .join("");
-      setTranscript(currentTranscript);
-    };
-
-    recognition.onerror = (event: any) => {
-      console.error("Speech recognition error:", event.error);
-      if (event.error === "not-allowed") {
-        toast.error("Microphone access was denied. Switching to text entry.");
-        setUseTextFallback(true);
-      } else {
-        toast.error(`Mic error: ${event.error}. Please try again.`);
-      }
-      stopListeningState();
-    };
-
-    recognition.onend = () => {
-      stopListeningState();
-    };
-
-    recognition.start();
-  };
-
-  const stopListeningState = () => {
-    setSpeakingUser(false);
-    stopMicVolume();
-  };
-
-  const submitVoiceAnswer = async () => {
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-    }
-    stopListeningState();
-
-    if (!transcript.trim()) {
-      toast.error("You didn't say anything yet. Please try speaking again.");
-      return;
-    }
-
-    await submitAnswer(transcript);
-  };
-
-  // Submit Answer handler
-  const submitAnswer = async (answerText: string) => {
-    setStatus("🤖 Thinking...");
-    setLoading(true);
+  // AI voice stream volume analyser
+  const setupAIVolumeAnalyser = (stream: MediaStream) => {
     try {
-      const response = await axios.post(`${BACKEND_URL}/api/v1/interview/chat`, {
-        interviewId,
-        answer: answerText,
-      });
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = new AudioContextClass();
+      aiAudioCtxRef.current = ctx;
 
-      const { reply, ended } = response.data;
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      aiAnalyserRef.current = analyser;
 
-      setTranscript("");
-      setTypedAnswer("");
+      source.connect(analyser);
 
-      if (ended) {
-        setIsEnded(true);
-        setStatus("✅ Completed!");
-        setCurrentQuestion(reply);
-        if (voiceOutputEnabled) {
-          speakText(reply);
+      const bufferLength = analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+
+      const checkVolume = () => {
+        if (!aiAnalyserRef.current) return;
+        aiAnalyserRef.current.getByteTimeDomainData(dataArray);
+
+        let sum = 0;
+        for (let i = 0; i < bufferLength; i++) {
+          const val = (dataArray[i]! - 128) / 128;
+          sum += val * val;
         }
-        // Automatically redirect to result page after 4 seconds
-        setTimeout(() => {
-          navigate(`/result/${interviewId}`);
-        }, 4500);
-      } else {
-        setCurrentQuestion(reply);
-        setQuestionCount((prev) => prev + 1);
-        setStatus("Ready");
-        
-        if (voiceOutputEnabled) {
-          speakText(reply);
-        } else {
-          setStatus(useTextFallback ? "Ready" : "🎤 Listening for your answer...");
-          if (!useTextFallback) {
-            setTimeout(() => {
-              startListening();
-            }, 600);
+        const rms = Math.sqrt(sum / bufferLength);
+        const level = Math.min(1, rms * 6);
+        setVolumeAI(level);
+        setSpeakingAI(level > 0.05);
+
+        aiAnimationFrameRef.current = requestAnimationFrame(checkVolume);
+      };
+
+      checkVolume();
+    } catch (err) {
+      console.warn("Could not start AI speech volume tracker:", err);
+    }
+  };
+
+  const setupDataChannelListeners = (dc: RTCDataChannel) => {
+    dc.onopen = () => {
+      console.log("WebRTC event data channel opened.");
+      setStatus("Connected - AI interviewer is starting");
+
+      // Trigger initial response from agent (greeting)
+      dc.send(JSON.stringify({
+        type: "response.create"
+      }));
+    };
+
+    dc.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        console.log("OpenAI Realtime Event:", data);
+
+        if (data.type === "error") {
+          const message = data.error?.message || "Realtime voice session error.";
+          toast.error(message);
+          setStatus("Realtime error");
+          return;
+        }
+
+        // Clear display text when a new generation begins
+        if (data.type === "response.created") {
+          setCurrentQuestion("");
+          setStatus("AI interviewer is speaking");
+        }
+
+        // Handle streaming text chunks for the typewriter effect
+        if (
+          data.type === "response.output_audio_transcript.delta" ||
+          data.type === "response.audio_transcript.delta" ||
+          data.type === "response.output_text.delta"
+        ) {
+          setCurrentQuestion((prev) => prev + data.delta);
+        }
+
+        // Sync complete AI message
+        if (
+          data.type === "response.output_audio_transcript.done" ||
+          data.type === "response.audio_transcript.done" ||
+          data.type === "response.output_text.done"
+        ) {
+          const content = data.transcript || data.text || "";
+          if (content.trim()) {
+            const visibleContent = content.replace(/\s*\[\[INTERVIEW_COMPLETE\]\]\s*/g, "").trim();
+            const nextMessages = appendChatMessage({ role: "assistant", content: visibleContent });
+            setCurrentQuestion(visibleContent);
+            updateQuestionProgress(visibleContent);
+
+            if (isCompletionText(visibleContent)) {
+              setIsEnded(true);
+              setStatus("Interview complete");
+              window.setTimeout(() => {
+                void finalizeInterview(nextMessages);
+              }, 1800);
+            } else {
+              setStatus(useTextFallbackRef.current ? "Waiting for typed answer" : "Listening for your answer");
+            }
           }
         }
+
+        // Sync completed Whisper transcription of user speech
+        if (data.type === "conversation.item.input_audio_transcription.completed") {
+          const content = data.transcript || "";
+          if (content.trim()) {
+            setTranscript(content);
+            appendChatMessage({ role: "user", content });
+            setStatus("AI interviewer is thinking");
+          }
+        }
+      } catch (err) {
+        console.error("Error parsing Realtime event:", err);
       }
-    } catch (err: any) {
-      console.error("Submit answer error:", err);
-      toast.error("Failed to submit response. Please try again.");
-      setStatus("Ready");
-      setLoading(false);
+    };
+  };
+
+  // Submit text answer fallback
+  const submitAnswer = (answerText: string) => {
+    if (!answerText.trim()) return;
+
+    appendChatMessage({ role: "user", content: answerText });
+    setTypedAnswer("");
+    setTranscript(answerText.trim());
+
+    if (dcRef.current && dcRef.current.readyState === "open") {
+      dcRef.current.send(JSON.stringify({
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: answerText,
+            }
+          ]
+        }
+      }));
+
+      dcRef.current.send(JSON.stringify({
+        type: "response.create"
+      }));
+      setStatus("AI interviewer is thinking");
+    } else {
+      toast.error("Real-time voice connection is not active.");
     }
   };
 
   // Toggle speaker mute
   const toggleVoiceOutput = () => {
     if (voiceOutputEnabled) {
-      stopSpeaking();
       setVoiceOutputEnabled(false);
+      if (audioElRef.current) {
+        audioElRef.current.muted = true;
+      }
       toast.success("AI voice muted.");
     } else {
       setVoiceOutputEnabled(true);
-      toast.success("AI voice enabled.");
-      if (currentQuestion && !speakingUser && !speakingAI) {
-        speakText(currentQuestion);
+      if (audioElRef.current) {
+        audioElRef.current.muted = false;
       }
+      toast.success("AI voice enabled.");
     }
   };
 
-  // End early triggers immediate evaluation
-  const handleEndEarly = async () => {
-    stopSpeaking();
-    stopMicVolume();
-    if (recognitionRef.current) {
-      recognitionRef.current.abort();
+  // Conclude interview session and redirect to evaluation scorecard
+  const handleEndEarly = () => {
+    void finalizeInterview();
+  };
+
+  const toggleTextFallback = async () => {
+    const nextTextMode = !useTextFallback;
+
+    if (nextTextMode) {
+      await detachMicrophoneFromSession();
+      setUseTextFallback(true);
+      setStatus("Text input active");
+      toast.success("Text input mode enabled.");
+      return;
     }
 
-    setStatus("🤖 Evaluating...");
-    setLoading(true);
-
-    try {
-      await axios.post(`${BACKEND_URL}/api/v1/interview/end`, { interviewId });
-      toast.success("Interview submitted for early evaluation.");
-      navigate(`/result/${interviewId}`);
-    } catch (err: any) {
-      console.error("Failed to end interview early:", err);
-      toast.error("Failed to finalize evaluation. Redirecting to results.");
-      navigate(`/result/${interviewId}`);
+    setStatus("Requesting microphone access...");
+    const micAttached = await attachMicrophoneToSession();
+    if (micAttached) {
+      setUseTextFallback(false);
+      setStatus("Live voice input active");
+      toast.success("Voice input enabled. Speak naturally after the AI asks.");
+    } else {
+      setUseTextFallback(true);
     }
   };
 
@@ -504,7 +701,7 @@ export function Interview() {
                 Interview Settings
               </h2>
 
-              {/* Preference 1: Voice Readout Toggle */}
+              {/* Preference 1: Voice Playback Toggle */}
               <label className="flex items-start gap-3.5 cursor-pointer group">
                 <input
                   type="checkbox"
@@ -514,26 +711,26 @@ export function Interview() {
                 />
                 <div>
                   <span className="text-sm font-semibold text-slate-200 group-hover:text-orange-400 transition-colors">
-                    Enable AI Voice Agent Read-Aloud
+                    Enable AI Voice Playback
                   </span>
                   <p className="text-xs text-slate-500 leading-relaxed mt-0.5 font-medium">
-                    The AI interviewer will speak the questions out loud. Turn this off if you prefer a text-only read.
+                    The Realtime interviewer will speak naturally over the live connection. Turn this off to mute local playback.
                   </p>
                 </div>
               </label>
 
-              {/* Voice Dropdown (shown only when readout is enabled) */}
-              {voiceOutputEnabled && voices.length > 0 && (
+              {/* OpenAI Realtime Voice Dropdown */}
+              {voiceOutputEnabled && (
                 <div className="flex flex-col gap-2 pl-7.5">
-                  <span className="text-xs text-slate-400 font-bold tracking-tight">Select AI Voice Pitch/Accent</span>
+                  <span className="text-xs text-slate-400 font-bold tracking-tight">Select AI Voice</span>
                   <select
-                    value={selectedVoiceName}
-                    onChange={(e) => setSelectedVoiceName(e.target.value)}
+                    value={selectedRealtimeVoice}
+                    onChange={(e) => setSelectedRealtimeVoice(e.target.value as RealtimeVoice)}
                     className="bg-[#070708] border border-white/10 hover:border-white/20 focus:border-orange-500 rounded-xl px-3.5 py-2 text-xs text-slate-200 focus:outline-none w-full max-w-xs transition-colors"
                   >
-                    {voices.map((v, idx) => (
-                      <option key={idx} value={v.name} className="bg-[#111113] text-slate-200">
-                        {v.name.replace("Microsoft", "").replace("Google", "").trim()} ({v.lang})
+                    {REALTIME_VOICES.map((voice) => (
+                      <option key={voice.id} value={voice.id} className="bg-[#111113] text-slate-200">
+                        {voice.label} - {voice.description}
                       </option>
                     ))}
                   </select>
@@ -657,7 +854,7 @@ export function Interview() {
               level={volumeUser}
               speaking={speakingUser}
               label="You"
-              sublabel={useTextFallback ? "Text Mode Enabled" : "Silent (Click speak to talk)"}
+              sublabel={useTextFallback ? "Text Mode Enabled" : "Live mic connected"}
               icon={User}
               accent="orange"
             />
@@ -718,26 +915,12 @@ export function Interview() {
             <div className="flex gap-4">
               {/* Voice controls */}
               {!useTextFallback ? (
-                <>
-                  {!speakingUser ? (
-                    <Button
-                      disabled={speakingAI || isEnded || loading}
-                      onClick={startListening}
-                      className="px-8 py-6 rounded-xl bg-[#ff4f12] hover:bg-[#ff3b00] text-white font-semibold transition-all duration-200 shadow-md shadow-orange-500/10 flex items-center gap-2.5 text-base border-0 cursor-pointer"
-                    >
-                      <Volume2 className="h-5 w-5" />
-                      Speak Response
-                    </Button>
-                  ) : (
-                    <Button
-                      onClick={submitVoiceAnswer}
-                      className="px-8 py-6 rounded-xl bg-gradient-to-r from-orange-500 to-red-600 hover:from-orange-600 hover:to-red-700 text-white font-semibold transition-all duration-200 shadow-md shadow-orange-500/10 flex items-center gap-2.5 text-base border-0 animate-pulse cursor-pointer"
-                    >
-                      <ArrowRight className="h-5 w-5" />
-                      Done Speaking
-                    </Button>
-                  )}
-                </>
+                <div className="flex flex-col items-center">
+                  <div className="px-8 py-4 rounded-xl bg-orange-500/10 border border-orange-500/20 text-orange-400 text-sm font-bold flex items-center gap-2.5 shadow-md shadow-orange-500/5 animate-pulse">
+                    <Mic className="h-4.5 w-4.5 text-orange-400 animate-pulse" />
+                    Live Voice Session Active - Speak Naturally
+                  </div>
+                </div>
               ) : (
                 /* Text Input Fallback */
                 <div className="flex flex-col w-full max-w-xl gap-2 bg-[#111113]/85 p-3 rounded-2xl border border-white/5 shadow-xl">
@@ -769,25 +952,15 @@ export function Interview() {
                 </div>
               )}
 
-              {/* Text Fallback Toggle button (only when not speaking) */}
-              {!speakingUser && (
-                <Button
-                  variant="outline"
-                  onClick={() => setUseTextFallback((prev) => !prev)}
-                  className="px-5 py-6 rounded-xl border border-white/10 bg-[#111113]/50 hover:bg-[#111113] hover:border-orange-500/20 text-slate-300 flex items-center gap-2 text-sm transition-colors cursor-pointer"
-                >
-                  {useTextFallback ? "Use Voice" : "Type Answer Instead"}
-                </Button>
-              )}
+              {/* Text Fallback Toggle button */}
+              <Button
+                variant="outline"
+                onClick={toggleTextFallback}
+                className="px-5 py-6 rounded-xl border border-white/10 bg-[#111113]/50 hover:bg-[#111113] hover:border-orange-500/20 text-slate-300 flex items-center gap-2 text-sm transition-colors cursor-pointer"
+              >
+                {useTextFallback ? "Use Voice" : "Type Answer Instead"}
+              </Button>
             </div>
-
-            {/* Warn/Error states regarding browsers compatibility */}
-            {!useTextFallback && !("webkitSpeechRecognition" in window) && (
-              <div className="flex items-center gap-2 text-orange-400 text-xs bg-orange-500/5 px-3 py-1.5 rounded-lg border border-orange-500/10 mt-2 font-medium">
-                <AlertCircle className="h-4 w-4 shrink-0" />
-                <span>Speech Recognition requires Chrome, Safari, or Edge. We've default enabled Type-fallback.</span>
-              </div>
-            )}
           </div>
         </div>
       </main>
@@ -798,11 +971,11 @@ export function Interview() {
         <Button
           variant="ghost"
           onClick={handleEndEarly}
-          disabled={loading || isEnded}
+          disabled={loading || finalizing}
           className="text-xs text-rose-400 hover:text-rose-300 hover:bg-rose-500/5 hover:border-rose-500/10 flex items-center gap-1.5 border border-transparent rounded-lg px-3 py-1.5 transition-all duration-200 cursor-pointer"
         >
           <StopCircle className="h-3.5 w-3.5" />
-          End Interview Early
+          {isEnded ? "View Scorecard" : "End Interview Early"}
         </Button>
       </footer>
     </div>
