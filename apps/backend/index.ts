@@ -2,13 +2,13 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import PDFDocument from "pdfkit";
-import { prisma } from "./db";
-import { scrapeGithub } from "./scrapers/github";
+import { prisma } from "./db.js";
+import { scrapeGithub } from "./scrapers/github.js";
 import {
   generateProfileAndQuestions,
   evaluateAnswerAndGetNextQuestion,
   generateFinalEvaluation,
-} from "./services/ai";
+} from "./services/ai.js";
 
 const app = express();
 app.use(express.json());
@@ -794,6 +794,10 @@ app.post("/api/v1/interview/:interviewId/finalize", async (req, res) => {
   }
 });
 
-app.listen(3001, () => {
-  console.log("🚀 Backend server listening on port 3001");
-});
+if (process.env.NODE_ENV !== "production") {
+  app.listen(3001, () => {
+    console.log("🚀 Backend server listening on port 3001");
+  });
+}
+
+export default app;

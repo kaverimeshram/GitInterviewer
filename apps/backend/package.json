@@ -4,7 +4,9 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "bun --hot index.ts"
+    "dev": "bun --hot index.ts",
+    "build": "prisma generate",
+    "postinstall": "prisma generate"
   },
   "devDependencies": {
     "@types/bun": "latest",
