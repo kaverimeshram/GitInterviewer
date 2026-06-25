@@ -2,13 +2,13 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import PDFDocument from "pdfkit";
-import { prisma } from "./db.js";
-import { scrapeGithub } from "./scrapers/github.js";
+import { prisma } from "../db.js";
+import { scrapeGithub } from "../scrapers/github.js";
 import {
   generateProfileAndQuestions,
   evaluateAnswerAndGetNextQuestion,
   generateFinalEvaluation,
-} from "./services/ai.js";
+} from "../services/ai.js";
 
 const app = express();
 app.use(express.json());
@@ -27,6 +27,7 @@ const REALTIME_VOICES = new Set([
   "verse",
   "marin",
   "cedar",
+  "dirty",
 ]);
 
 // POST /api/v1/pre-interview
