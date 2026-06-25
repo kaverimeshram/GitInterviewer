@@ -652,7 +652,7 @@ Your instructions:
           type: "realtime",
           model: REALTIME_MODEL,
           instructions: systemInstructions,
-          modalities: ["text", "audio"],
+          output_modalities: ["audio"],
           audio: {
             input: {
               transcription: {
