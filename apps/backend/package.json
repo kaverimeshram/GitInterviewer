@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "bun --hot index.ts",
     "build": "prisma generate",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate || true"
   },
   "devDependencies": {
     "@types/bun": "latest",
