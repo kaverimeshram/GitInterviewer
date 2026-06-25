@@ -56,9 +56,9 @@ export function Interview() {
   const [finalizing, setFinalizing] = useState(false);
 
   // Audio/Visualizer state
-  const [volumeUser, setVolumeUser] = useState(0);
+  const [userStream, setUserStream] = useState<MediaStream | null>(null);
+  const [aiStream, setAiStream] = useState<MediaStream | null>(null);
   const [speakingUser, setSpeakingUser] = useState(false);
-  const [volumeAI, setVolumeAI] = useState(0);
   const [speakingAI, setSpeakingAI] = useState(false);
 
   // Fallback typing state
@@ -71,14 +71,7 @@ export function Interview() {
   const localStreamRef = useRef<MediaStream | null>(null);
   const audioSenderRef = useRef<RTCRtpSender | null>(null);
 
-  // Analysers & Contexts for Reactive Volume driving VoiceOrbs
-  const userAudioCtxRef = useRef<AudioContext | null>(null);
-  const userAnalyserRef = useRef<AnalyserNode | null>(null);
-  const userAnimationFrameRef = useRef<number | null>(null);
-
-  const aiAudioCtxRef = useRef<AudioContext | null>(null);
-  const aiAnalyserRef = useRef<AnalyserNode | null>(null);
-  const aiAnimationFrameRef = useRef<number | null>(null);
+  // Analysers & Contexts for Reactive Volume driving VoiceOrbs (Moved inside VoiceOrb component)
   const finalizingRef = useRef(false);
   const useTextFallbackRef = useRef(useTextFallback);
 
@@ -118,19 +111,7 @@ export function Interview() {
     });
   };
 
-  const stopUserVolumeAnalyser = () => {
-    if (userAnimationFrameRef.current) {
-      cancelAnimationFrame(userAnimationFrameRef.current);
-      userAnimationFrameRef.current = null;
-    }
-    if (userAudioCtxRef.current) {
-      void userAudioCtxRef.current.close();
-      userAudioCtxRef.current = null;
-    }
-    userAnalyserRef.current = null;
-    setVolumeUser(0);
-    setSpeakingUser(false);
-  };
+  // Audio analyzer lifecycle managed by VoiceOrb components
 
   const requestMicrophoneStream = async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -171,8 +152,7 @@ export function Interview() {
         audioSenderRef.current = pc.addTrack(audioTrack, localStream);
       }
 
-      stopUserVolumeAnalyser();
-      setupUserVolumeAnalyser(localStream);
+      setUserStream(localStream);
       return true;
     } catch (err: any) {
       console.error("Failed to enable microphone input:", err);
@@ -197,7 +177,7 @@ export function Interview() {
     if (audioSenderRef.current) {
       await audioSenderRef.current.replaceTrack(null);
     }
-    stopUserVolumeAnalyser();
+    setUserStream(null);
   };
 
   useEffect(() => {
@@ -234,25 +214,9 @@ export function Interview() {
   }, [interviewId]);
 
   const cleanupWebRTC = () => {
-    if (userAnimationFrameRef.current) {
-      cancelAnimationFrame(userAnimationFrameRef.current);
-      userAnimationFrameRef.current = null;
-    }
-    if (aiAnimationFrameRef.current) {
-      cancelAnimationFrame(aiAnimationFrameRef.current);
-      aiAnimationFrameRef.current = null;
-    }
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
-    }
-    if (userAudioCtxRef.current) {
-      void userAudioCtxRef.current.close();
-      userAudioCtxRef.current = null;
-    }
-    if (aiAudioCtxRef.current) {
-      void aiAudioCtxRef.current.close();
-      aiAudioCtxRef.current = null;
     }
     if (dcRef.current) {
       dcRef.current.close();
@@ -267,10 +231,8 @@ export function Interview() {
       audioElRef.current.remove();
       audioElRef.current = null;
     }
-    userAnalyserRef.current = null;
-    aiAnalyserRef.current = null;
-    setVolumeUser(0);
-    setVolumeAI(0);
+    setUserStream(null);
+    setAiStream(null);
     setSpeakingUser(false);
     setSpeakingAI(false);
   };
@@ -333,7 +295,7 @@ export function Interview() {
       // 4. Handle incoming tracks (AI Voice)
       pc.ontrack = (event) => {
         audioEl.srcObject = event.streams[0];
-        setupAIVolumeAnalyser(event.streams[0]);
+        setAiStream(event.streams[0]);
       };
 
       // 5. Configure audio input. Text mode should not request microphone access.
@@ -347,7 +309,7 @@ export function Interview() {
         if (audioTrack) {
           audioSenderRef.current = pc.addTrack(audioTrack, localStream);
         }
-        setupUserVolumeAnalyser(localStream);
+        setUserStream(localStream);
       }
 
       // 6. Create event data channel
@@ -398,85 +360,7 @@ export function Interview() {
     }
   };
 
-  // User mic volume analyser
-  const setupUserVolumeAnalyser = (stream: MediaStream) => {
-    try {
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      const ctx = new AudioContextClass();
-      userAudioCtxRef.current = ctx;
-
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      userAnalyserRef.current = analyser;
-
-      source.connect(analyser);
-
-      const bufferLength = analyser.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-
-      const checkVolume = () => {
-        if (!userAnalyserRef.current) return;
-        userAnalyserRef.current.getByteTimeDomainData(dataArray);
-
-        let sum = 0;
-        for (let i = 0; i < bufferLength; i++) {
-          const val = (dataArray[i]! - 128) / 128;
-          sum += val * val;
-        }
-        const rms = Math.sqrt(sum / bufferLength);
-        const level = Math.min(1, rms * 6);
-        setVolumeUser(level);
-        setSpeakingUser(level > 0.05);
-
-        userAnimationFrameRef.current = requestAnimationFrame(checkVolume);
-      };
-
-      checkVolume();
-    } catch (err) {
-      console.warn("Could not start local microphone volume tracker:", err);
-    }
-  };
-
-  // AI voice stream volume analyser
-  const setupAIVolumeAnalyser = (stream: MediaStream) => {
-    try {
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      const ctx = new AudioContextClass();
-      aiAudioCtxRef.current = ctx;
-
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      aiAnalyserRef.current = analyser;
-
-      source.connect(analyser);
-
-      const bufferLength = analyser.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-
-      const checkVolume = () => {
-        if (!aiAnalyserRef.current) return;
-        aiAnalyserRef.current.getByteTimeDomainData(dataArray);
-
-        let sum = 0;
-        for (let i = 0; i < bufferLength; i++) {
-          const val = (dataArray[i]! - 128) / 128;
-          sum += val * val;
-        }
-        const rms = Math.sqrt(sum / bufferLength);
-        const level = Math.min(1, rms * 6);
-        setVolumeAI(level);
-        setSpeakingAI(level > 0.05);
-
-        aiAnimationFrameRef.current = requestAnimationFrame(checkVolume);
-      };
-
-      checkVolume();
-    } catch (err) {
-      console.warn("Could not start AI speech volume tracker:", err);
-    }
-  };
+  // Voice volume analysis and visualizer loops are handled internally by the VoiceOrb components
 
   const setupDataChannelListeners = (dc: RTCDataChannel) => {
     dc.onopen = () => {
@@ -839,24 +723,24 @@ export function Interview() {
           {/* AI INTERVIEWER ORB */}
           <div className="flex flex-col items-center">
             <VoiceOrb
-              level={volumeAI}
-              speaking={speakingAI}
+              stream={aiStream}
               label="AI Interviewer"
               sublabel={voiceOutputEnabled ? "Speaking..." : "Voice Muted (Reading Question)"}
               icon={Bot}
               accent="orange"
+              onSpeakingChange={setSpeakingAI}
             />
           </div>
 
           {/* CANDIDATE ORB */}
           <div className="flex flex-col items-center">
             <VoiceOrb
-              level={volumeUser}
-              speaking={speakingUser}
+              stream={userStream}
               label="You"
               sublabel={useTextFallback ? "Text Mode Enabled" : "Live mic connected"}
               icon={User}
               accent="orange"
+              onSpeakingChange={setSpeakingUser}
             />
           </div>
         </div>
